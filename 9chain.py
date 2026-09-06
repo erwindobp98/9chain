@@ -1,4 +1,5 @@
 import base64
+import datetime
 import json
 import sys
 import time
@@ -133,7 +134,10 @@ def response_json(res: requests.Response) -> Dict[str, Any]:
 
 
 def auth_headers(token: str) -> Dict[str, str]:
-    return {**HEADERS_BASE, "Authorization": f"Bearer {token}"}
+    return {
+        **HEADERS_BASE, 
+        "Authorization": f"Bearer {token}",
+    }
 
 
 def login(email: str, password: str) -> str:
@@ -255,7 +259,7 @@ def tap_once(token: str, count: int) -> Dict[str, Any]:
     return data.get("data") or {}
 
 
-def tap_all(token: str, start_count: int = 1000) -> Dict[str, Any]:
+def tap_all(token: str, start_count: int = 100) -> Dict[str, Any]:
     batch_size = start_count
     last_result: Optional[Dict[str, Any]] = None
     history: List[Dict[str, Any]] = []
@@ -285,7 +289,7 @@ def tap_all(token: str, start_count: int = 1000) -> Dict[str, Any]:
             else:
                 raise
 
-        time.sleep(1.1)
+        time.sleep(2.0)
 
     if batch_size < 1:
         raise ApiError("Tidak bisa menemukan batch size yang valid untuk tap.")
@@ -306,7 +310,7 @@ def tap_all(token: str, start_count: int = 1000) -> Dict[str, Any]:
 
         if (result.get("state") or {}).get("tapsRemaining", 0) <= 0:
             break
-        time.sleep(1.1)
+        time.sleep(2.0)
 
     final_state = (last_result or {}).get("state") or {}
     return {
@@ -324,7 +328,7 @@ def get_state(token: str) -> Dict[str, Any]:
     res, data = api_request("GET", "/program/state", token)
     if not res.ok or not data.get("success"):
         raise ApiError(f"state gagal: {res.status_code} {json.dumps(data, ensure_ascii=False)}")
-    return data.get("data") or {}
+    return data
 
 
 def get_catalog(token: str) -> List[Dict[str, Any]]:
@@ -402,7 +406,8 @@ def upgrade_components(token: str, selected_keys: Sequence[str]) -> List[Dict[st
 
 def upgrade_tier(token: str) -> Dict[str, Any]:
     state = get_state(token)
-    next_tier = state.get("nextTier")
+    state_data = state.get("data") or {}
+    next_tier = state_data.get("nextTier")
     if not next_tier:
         return {"skipped": True, "reason": "sudah tier maksimal"}
 
@@ -480,19 +485,38 @@ def short_account(email: str) -> str:
     return email[:30]
 
 
-def extract_server_balance(state: Dict[str, Any]) -> Optional[float]:
-    """Mengambil angka balance resmi langsung dari response API server."""
-    candidates = [
-        state.get("balance"),
-        state.get("xpTotal"),
-        state.get("totalBalance"),
-        state.get("availableBalance"),
-    ]
-    for val in candidates:
-        num = _safe_float(val)
-        if num is not None:
-            return num
-    return None
+def extract_server_balance(state_response: Dict[str, Any]) -> Optional[float]:
+    """Mengambil Saldo Aktif dari response API."""
+    if not isinstance(state_response, dict):
+        return None
+
+    target_keys = ["balance", "currentbalance", "availablebalance", "spendablebalance", "points"]
+
+    def _search_dict(d: dict) -> Optional[float]:
+        for k, v in d.items():
+            if k.lower() in target_keys:
+                num = _safe_float(v)
+                if num is not None:
+                    return num
+            if isinstance(v, dict):
+                res = _search_dict(v)
+                if res is not None:
+                    return res
+        return None
+
+    return _search_dict(state_response)
+
+
+def extract_node_tier(state_response: Dict[str, Any]) -> str:
+    """Mengambil level Node Tier dari response API."""
+    if not isinstance(state_response, dict):
+        return "-"
+    
+    data = state_response.get("data") or state_response
+    tier = data.get("nodeTier") or data.get("tier")
+    if tier is not None:
+        return f"Tier {tier}"
+    return "-"
 
 
 def make_dashboard(rows: List[Dict[str, Any]], phase: str, cycle: int, countdown: str = ""):
@@ -506,12 +530,11 @@ def make_dashboard(rows: List[Dict[str, Any]], phase: str, cycle: int, countdown
     table.add_column("LOGIN", no_wrap=True)
     table.add_column("DAILY", no_wrap=True)
     table.add_column("TAP-TAP", no_wrap=True)
-    table.add_column("BALANCE (API)", justify="right", no_wrap=True)
+    table.add_column("TIER", justify="center", no_wrap=True)
     table.add_column("DETAIL", overflow="ellipsis")
 
     for row in rows:
-        bal = row.get("server_balance")
-        balance_text = f"{bal:,.2f}" if bal is not None else "-"
+        tier_text = str(row.get("tier", "-"))
 
         table.add_row(
             str(row["index"]),
@@ -519,7 +542,7 @@ def make_dashboard(rows: List[Dict[str, Any]], phase: str, cycle: int, countdown
             str(row.get("login", "WAIT")),
             str(row.get("daily", "WAIT")),
             str(row.get("tap", "WAIT")),
-            balance_text,
+            tier_text,
             str(row.get("detail", "")),
         )
 
@@ -536,19 +559,19 @@ def save_results(results: List[Dict[str, Any]]):
     )
 
 
-def fetch_and_update_balance(row: Dict[str, Any]) -> bool:
+def fetch_account_info(row: Dict[str, Any], token_cache: Optional[Dict[str, str]] = None):
+    """Mengambil informasi Tier dari server."""
+    email = row.get("email")
     token = row.get("_token")
-    if not token:
-        return False
+
+    if not email or not token:
+        return
+
     try:
-        state = get_state(token)
-        bal = extract_server_balance(state)
-        if bal is not None:
-            row["server_balance"] = bal
-            return True
+        data = get_state(token)
+        row["tier"] = extract_node_tier(data)
     except Exception:
         pass
-    return False
 
 
 def _account_worker(account, token_cache_snapshot, action, selected_components=None):
@@ -562,7 +585,7 @@ def _account_worker(account, token_cache_snapshot, action, selected_components=N
     if action == "daily":
         result["checkin"] = with_program_retry(token, "ID", lambda: check_in(token))
     elif action == "tap":
-        result["tap"] = with_program_retry(token, "ID", lambda: tap_all(token, 2))
+        result["tap"] = with_program_retry(token, "ID", lambda: tap_all(token, 100))
     elif action == "upgrade":
         result["upgrade"] = with_program_retry(
             token, "ID", lambda: upgrade_components(token, selected_components or [])
@@ -615,6 +638,9 @@ def _parallel_action(accounts, rows, token_cache, action, live, cycle, results, 
                 row["login"] = "CACHE" if result.get("tokenFromCache") else "LOGIN OK"
                 row["status_result"] = result
 
+                # Ambil info Tier saat aksi berjalan
+                fetch_account_info(row, token_cache)
+
                 if action == "daily":
                     checkin = result.get("checkin") or {}
                     if checkin.get("error"):
@@ -626,7 +652,6 @@ def _parallel_action(accounts, rows, token_cache, action, live, cycle, results, 
                     else:
                         row["daily"] = "SKIP"
                         row["detail"] = "Sudah check-in hari ini"
-                    fetch_and_update_balance(row)
 
                 elif action == "tap":
                     tap = result.get("tap") or {}
@@ -640,19 +665,16 @@ def _parallel_action(accounts, rows, token_cache, action, live, cycle, results, 
                             f"Tap batch={tap.get('batchSizeFound')} | "
                             f"remaining={final_state.get('tapsRemaining')}"
                         )
-                        fetch_and_update_balance(row)
 
                 elif action == "upgrade":
                     value = result.get("upgrade") or {}
                     res_parts = build_result_parts({"upgrade": value})
                     row["detail"] = res_parts[0] if res_parts else "Upgrade selesai"
-                    fetch_and_update_balance(row)
 
                 elif action == "tier":
                     value = result.get("tier") or {}
                     res_parts = build_result_parts({"tier": value})
                     row["detail"] = res_parts[0] if res_parts else "Tier selesai"
-                    fetch_and_update_balance(row)
 
                 results[pos].update(result)
                 results[pos]["status"] = "success"
@@ -686,26 +708,17 @@ def format_countdown(seconds):
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
-def live_balance_monitor_until_reset(accounts, rows, cycle, live):
-    """Secara paralel merefresh saldo langsung dari server API setiap 10 detik sekali."""
-    workers = min(MAX_WORKERS, max(1, len(accounts)))
-
+def standby_until_reset(rows: List[Dict[str, Any]], cycle: int, live: Any):
+    """Standby countdown murni tanpa background request ke server."""
     while True:
         remaining = seconds_until_next_daily()
         countdown = format_countdown(remaining)
+        
         if remaining <= 1.0:
             return
 
-        # Ambil saldo resmi dari API server secara paralel
-        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="sync_bal") as executor:
-            futures = [executor.submit(fetch_and_update_balance, row) for row in rows]
-            for future in as_completed(futures):
-                pass  # Tunggu semua akun selesai ter-update
-
-        live.update(make_dashboard(rows, "SYNC BALANCE (10s)", cycle, countdown))
-        
-        # Jeda 10 detik sebelum panggil API lagi
-        time.sleep(10.0)
+        live.update(make_dashboard(rows, "IDLE (STANDBY)", cycle, countdown=countdown))
+        time.sleep(1.0)
 
 
 def run_daily_tap_mining_loop(accounts, token_cache):
@@ -716,7 +729,7 @@ def run_daily_tap_mining_loop(accounts, token_cache):
             "login": "WAIT",
             "daily": "WAIT",
             "tap": "WAIT",
-            "server_balance": None,
+            "tier": "-",
             "detail": "Menunggu...",
         }
         for i, acc in enumerate(accounts, start=1)
@@ -743,15 +756,15 @@ def run_daily_tap_mining_loop(accounts, token_cache):
             _parallel_action(accounts, rows, token_cache, "tap", live, cycle, results)
             save_results(results)
 
-            # 3) Sync Balance Langsung Dari Server Setiap 10 Detik
-            live_balance_monitor_until_reset(accounts, rows, cycle, live)
+            # 3) Standby Tanpa Server Polling Hingga Reset Harian
+            standby_until_reset(rows, cycle, live)
 
 
 def choose_mode() -> str:
     print("\nPilih mode aksi:")
     print("  1) Daily check-in saja")
-    print("  2) Tap-tap saja (max 1000/day)")
-    print("  3) Daily + Tap-tap + Sync Balance Server (Loop 10s)")
+    print("  2) Tap-tap saja (max 100/request)")
+    print("  3) Daily + Tap-tap Loop (Auto Standby Reset Harian)")
     print("  4) Upgrade (komponen)")
     print("  5) Upgrade Tier")
     mode_map = {"1": "daily", "2": "tap", "3": "both", "4": "upgrade", "5": "tier"}
@@ -768,7 +781,12 @@ def choose_components_all_accounts(accounts, token_cache):
     save_token_cache(token_cache)
     catalog = get_catalog(token)
     state = get_state(token)
-    print(f"\nSaldo XP ({ref['email']}): {state.get('xpTotal')}\n")
+    bal = extract_server_balance(state)
+    tier = extract_node_tier(state)
+    
+    print(f"\n[Akun Acuan: {ref['email']}]")
+    print(f"Saldo Aktif : {bal:,.2f}" if bal is not None else "Saldo Aktif : -")
+    print(f"Node Tier   : {tier}\n")
     print("Komponen yang bisa di-upgrade:")
 
     menu_items = []
@@ -812,13 +830,20 @@ def preview_tier_all_accounts(accounts, token_cache):
     token_cache[ref["email"]] = token
     save_token_cache(token_cache)
     state = get_state(token)
-    print(f"\nSaldo XP ({ref['email']}): {state.get('xpTotal')}")
-    next_tier = state.get("nextTier")
+    bal = extract_server_balance(state)
+    tier = extract_node_tier(state)
+    
+    print(f"\n[Akun Acuan: {ref['email']}]")
+    print(f"Saldo Aktif : {bal:,.2f}" if bal is not None else "Saldo Aktif : -")
+    print(f"Node Tier   : {tier}")
+    
+    state_data = state.get("data") or {}
+    next_tier = state_data.get("nextTier")
     if next_tier:
         suffix = "" if next_tier.get("affordable") else " (saldo tidak cukup)"
-        print(f"Tier sekarang: {state.get('nodeTier')} -> {next_tier.get('tier')}, cost: {next_tier.get('cost')}{suffix}")
+        print(f"Next Tier   : Tier {next_tier.get('tier')} (Cost: {next_tier.get('cost')}){suffix}")
     else:
-        print("Sudah di tier maksimal.")
+        print("Status      : Sudah di tier maksimal.")
     return ask("\nLanjutkan upgrade tier untuk SEMUA akun? (y/n): ").lower() == "y"
 
 
@@ -848,7 +873,7 @@ def main() -> None:
             return
 
         rows = [
-            {"index": i, "email": a["email"], "login": "WAIT", "daily": "WAIT", "tap": "WAIT", "server_balance": None, "detail": "Menunggu..."}
+            {"index": i, "email": a["email"], "login": "WAIT", "daily": "WAIT", "tap": "WAIT", "tier": "-", "detail": "Menunggu..."}
             for i, a in enumerate(accounts, 1)
         ]
         results = [{"email": a["email"]} for a in accounts]
