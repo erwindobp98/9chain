@@ -56,7 +56,6 @@ def ask(question: str) -> str:
 
 
 def load_accounts(path: str | Path = "accounts.json") -> List[Dict[str, str]]:
-    """Load multi-account credentials from accounts.json."""
     p = Path(path)
     if not p.exists():
         raise FileNotFoundError(f"File tidak ditemukan: {p}")
@@ -105,7 +104,6 @@ def save_token_cache(cache: Dict[str, str]) -> None:
 
 
 def decode_jwt_exp(token: str) -> Optional[int]:
-    """Baca claim exp dari payload JWT tanpa memverifikasi signature."""
     try:
         payload = token.split(".")[1]
         padding = "=" * (-len(payload) % 4)
@@ -258,7 +256,6 @@ def tap_once(token: str, count: int) -> Dict[str, Any]:
 
 
 def tap_all(token: str, start_count: int = 1000) -> Dict[str, Any]:
-    """Port langsung dari algoritma pencarian batch pada script JS asal."""
     batch_size = start_count
     last_result: Optional[Dict[str, Any]] = None
     history: List[Dict[str, Any]] = []
@@ -430,26 +427,37 @@ def with_program_retry(token: str, country: str, func):
         return {"error": str(exc)}
 
 
-
 # ----------------------------- Parallel / Rich runtime -----------------------------
 
 try:
     from rich.live import Live
     from rich.table import Table
-    from rich.console import Console
     from rich.panel import Panel
-    from rich.text import Text
 except ImportError:
     Live = None
     Table = None
-    Console = None
     Panel = None
-    Text = None
 
 WIB_RESET_HOUR = 7
-MINING_POLL_SECONDS = 3.0
 MAX_WORKERS = 20
-INTER_ACCOUNT_DELAY = 0.0
+
+
+def build_result_parts(res: Dict[str, Any]) -> List[str]:
+    parts = []
+    if "upgrade" in res and isinstance(res["upgrade"], list):
+        for item in res["upgrade"]:
+            if isinstance(item, dict):
+                if item.get("levelTo"):
+                    parts.append(f"{item.get('componentKey')}: lvl {item.get('levelFrom')}->{item.get('levelTo')}")
+                elif item.get("reason"):
+                    parts.append(f"{item.get('componentKey')}: {item.get('reason')}")
+    if "tier" in res and isinstance(res["tier"], dict):
+        t = res["tier"]
+        if t.get("tierTo"):
+            parts.append(f"Tier: {t.get('tierFrom')}->{t.get('tierTo')}")
+        elif t.get("reason"):
+            parts.append(f"Tier: {t.get('reason')}")
+    return parts
 
 
 def _safe_float(value):
@@ -472,87 +480,45 @@ def short_account(email: str) -> str:
     return email[:30]
 
 
-def detect_balance(state: Dict[str, Any]):
-    """Read the live account balance from /program/state without a mining API."""
+def extract_server_balance(state: Dict[str, Any]) -> Optional[float]:
+    """Mengambil angka balance resmi langsung dari response API server."""
     candidates = [
         state.get("balance"),
         state.get("xpTotal"),
         state.get("totalBalance"),
         state.get("availableBalance"),
-        state.get("coins"),
-        state.get("lumis"),
-        state.get("credits"),
     ]
-    for value in candidates:
-        number = _safe_float(value)
-        if number is not None:
-            return number
-
-    for parent_key in ("account", "wallet", "node", "mining", "stats"):
-        obj = state.get(parent_key)
-        if isinstance(obj, dict):
-            for field in (
-                "balance", "xpTotal", "totalBalance", "availableBalance",
-                "coins", "lumis", "credits",
-            ):
-                number = _safe_float(obj.get(field))
-                if number is not None:
-                    return number
+    for val in candidates:
+        num = _safe_float(val)
+        if num is not None:
+            return num
     return None
-
-
-def detect_mining_info(state: Dict[str, Any]) -> str:
-    """Display-only information; mining itself is automatic."""
-    parts = []
-    for key, label in (
-        ("miningRate", "rate"),
-        ("powerPerHour", "power"),
-        ("runningNow", "running"),
-        ("powerGain", "gain"),
-        ("nodeTier", "tier"),
-    ):
-        if state.get(key) is not None:
-            parts.append(f"{label}={state[key]}")
-
-    for parent_key in ("mining", "node", "stats"):
-        obj = state.get(parent_key)
-        if isinstance(obj, dict):
-            for key, label in (
-                ("runningNow", "running"),
-                ("miningRate", "rate"),
-                ("powerPerHour", "power"),
-                ("powerGain", "gain"),
-            ):
-                if obj.get(key) is not None and f"{label}=" not in " ".join(parts):
-                    parts.append(f"{label}={obj[key]}")
-    return " ".join(parts) if parts else "AUTO / passive"
 
 
 def make_dashboard(rows: List[Dict[str, Any]], phase: str, cycle: int, countdown: str = ""):
     table = Table(
         title=f"🚀 9CHAIN • {phase} • CYCLE #{cycle}",
         expand=True,
-        show_lines=False,
+        show_lines=True,
     )
     table.add_column("#", justify="right", width=3)
     table.add_column("ACCOUNT", no_wrap=True)
     table.add_column("LOGIN", no_wrap=True)
     table.add_column("DAILY", no_wrap=True)
     table.add_column("TAP-TAP", no_wrap=True)
-    table.add_column("MINING", no_wrap=True)
-    table.add_column("BALANCE", justify="right", no_wrap=True)
+    table.add_column("BALANCE (API)", justify="right", no_wrap=True)
     table.add_column("DETAIL", overflow="ellipsis")
 
-    for row in rows:  # fixed accounts.json order; never append duplicate account rows
-        balance = row.get("balance")
-        balance_text = "-" if balance is None else f"{balance:,.2f}"
+    for row in rows:
+        bal = row.get("server_balance")
+        balance_text = f"{bal:,.2f}" if bal is not None else "-"
+
         table.add_row(
             str(row["index"]),
             short_account(row["email"]),
             str(row.get("login", "WAIT")),
             str(row.get("daily", "WAIT")),
             str(row.get("tap", "WAIT")),
-            str(row.get("mining", "WAIT")),
             balance_text,
             str(row.get("detail", "")),
         )
@@ -570,22 +536,22 @@ def save_results(results: List[Dict[str, Any]]):
     )
 
 
-def refresh_state_row(row: Dict[str, Any], token: str) -> bool:
-    """Poll the normal program state and update live balance."""
+def fetch_and_update_balance(row: Dict[str, Any]) -> bool:
+    token = row.get("_token")
+    if not token:
+        return False
     try:
         state = get_state(token)
-        row["balance"] = detect_balance(state)
-        row["mining"] = "RUNNING"
-        row["mining_info"] = detect_mining_info(state)
-        return True
-    except Exception as exc:
-        row["mining"] = "ERROR"
-        row["detail"] = f"state: {str(exc)[:100]}"
-        return False
+        bal = extract_server_balance(state)
+        if bal is not None:
+            row["server_balance"] = bal
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def _account_worker(account, token_cache_snapshot, action, selected_components=None):
-    """One worker owns one account. No worker waits for another account."""
     email = account["email"]
     password = account["password"]
     local_cache = {email: token_cache_snapshot.get(email)} if token_cache_snapshot.get(email) else {}
@@ -608,7 +574,6 @@ def _account_worker(account, token_cache_snapshot, action, selected_components=N
 
 
 def _parallel_action(accounts, rows, token_cache, action, live, cycle, results, selected_components=None):
-    """Run the requested action for ALL accounts concurrently."""
     phase_names = {
         "daily": "DAILY",
         "tap": "TAP-TAP",
@@ -661,7 +626,7 @@ def _parallel_action(accounts, rows, token_cache, action, live, cycle, results, 
                     else:
                         row["daily"] = "SKIP"
                         row["detail"] = "Sudah check-in hari ini"
-                    refresh_state_row(row, result["token"])
+                    fetch_and_update_balance(row)
 
                 elif action == "tap":
                     tap = result.get("tap") or {}
@@ -675,15 +640,19 @@ def _parallel_action(accounts, rows, token_cache, action, live, cycle, results, 
                             f"Tap batch={tap.get('batchSizeFound')} | "
                             f"remaining={final_state.get('tapsRemaining')}"
                         )
-                        refresh_state_row(row, result["token"])
+                        fetch_and_update_balance(row)
 
                 elif action == "upgrade":
                     value = result.get("upgrade") or {}
-                    row["detail"] = build_result_parts({"upgrade": value})[0] if build_result_parts({"upgrade": value}) else "Upgrade selesai"
+                    res_parts = build_result_parts({"upgrade": value})
+                    row["detail"] = res_parts[0] if res_parts else "Upgrade selesai"
+                    fetch_and_update_balance(row)
 
                 elif action == "tier":
                     value = result.get("tier") or {}
-                    row["detail"] = build_result_parts({"tier": value})[0] if build_result_parts({"tier": value}) else "Tier selesai"
+                    res_parts = build_result_parts({"tier": value})
+                    row["detail"] = res_parts[0] if res_parts else "Tier selesai"
+                    fetch_and_update_balance(row)
 
                 results[pos].update(result)
                 results[pos]["status"] = "success"
@@ -717,39 +686,29 @@ def format_countdown(seconds):
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
-def mine_monitor_until_reset(accounts, rows, cycle, live):
-    """Continuous passive mining monitor. It ends only when daily reset arrives."""
+def live_balance_monitor_until_reset(accounts, rows, cycle, live):
+    """Secara paralel merefresh saldo langsung dari server API setiap 10 detik sekali."""
+    workers = min(MAX_WORKERS, max(1, len(accounts)))
+
     while True:
         remaining = seconds_until_next_daily()
+        countdown = format_countdown(remaining)
         if remaining <= 1.0:
             return
 
-        # Poll every account concurrently so a slow account never blocks others.
-        with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(accounts)), thread_name_prefix="monitor") as executor:
-            futures = {}
-            for pos, row in enumerate(rows):
-                token = row.get("_token")
-                if token:
-                    futures[executor.submit(get_state, token)] = pos
-
+        # Ambil saldo resmi dari API server secara paralel
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="sync_bal") as executor:
+            futures = [executor.submit(fetch_and_update_balance, row) for row in rows]
             for future in as_completed(futures):
-                pos = futures[future]
-                row = rows[pos]
-                try:
-                    state = future.result()
-                    row["balance"] = detect_balance(state)
-                    row["mining"] = "ACTIVE"
-                    row["detail"] = f"AUTO • {detect_mining_info(state)} • reset {format_countdown(remaining)}"
-                except Exception as exc:
-                    row["mining"] = "ERROR"
-                    row["detail"] = f"monitor: {str(exc)[:90]}"
-                live.update(make_dashboard(rows, "MINING MONITOR", cycle, format_countdown(remaining)))
+                pass  # Tunggu semua akun selesai ter-update
 
-        time.sleep(MINING_POLL_SECONDS)
+        live.update(make_dashboard(rows, "SYNC BALANCE (10s)", cycle, countdown))
+        
+        # Jeda 10 detik sebelum panggil API lagi
+        time.sleep(10.0)
 
 
 def run_daily_tap_mining_loop(accounts, token_cache):
-    """Daily -> Tap-Tap -> wait reset -> continuous mining monitor -> repeat."""
     rows = [
         {
             "index": i,
@@ -757,8 +716,7 @@ def run_daily_tap_mining_loop(accounts, token_cache):
             "login": "WAIT",
             "daily": "WAIT",
             "tap": "WAIT",
-            "mining": "WAIT",
-            "balance": None,
+            "server_balance": None,
             "detail": "Menunggu...",
         }
         for i, acc in enumerate(accounts, start=1)
@@ -775,42 +733,25 @@ def run_daily_tap_mining_loop(accounts, token_cache):
             for row in rows:
                 row["daily"] = "WAIT"
                 row["tap"] = "WAIT"
-                row["mining"] = "WAIT"
-                row["detail"] = "Starting daily cycle..."
+                row["detail"] = "Memulai siklus harian..."
             live.update(make_dashboard(rows, "DAILY", cycle))
 
-            # 1) DAILY: all accounts start together.
+            # 1) DAILY
             _parallel_action(accounts, rows, token_cache, "daily", live, cycle, results)
 
-            # 2) TAP-TAP: all accounts start together, independent of mining.
+            # 2) TAP-TAP
             _parallel_action(accounts, rows, token_cache, "tap", live, cycle, results)
             save_results(results)
 
-            # 3) Wait for the next daily reset BEFORE starting the mining monitor.
-            #    This keeps the requested order: DAILY -> TAP-TAP -> WAIT -> MINING.
-            remaining = seconds_until_next_daily()
-            while remaining > 0:
-                countdown = format_countdown(remaining)
-                for row in rows:
-                    row["mining"] = "WAIT"
-                    row["detail"] = f"Menunggu reset daily • {countdown}"
-                live.update(make_dashboard(rows, "WAIT RESET", cycle, countdown))
-                time.sleep(min(30, remaining))
-                remaining = seconds_until_next_daily()
-
-            # 4) Mining is already automatic; only monitor live balance until the
-            # next daily cycle. No 1000 tap limit is consulted here.
-            for row in rows:
-                row["mining"] = "ACTIVE"
-                row["detail"] = "Mining otomatis • live balance monitor"
-            mine_monitor_until_reset(accounts, rows, cycle, live)
+            # 3) Sync Balance Langsung Dari Server Setiap 10 Detik
+            live_balance_monitor_until_reset(accounts, rows, cycle, live)
 
 
 def choose_mode() -> str:
     print("\nPilih mode aksi:")
     print("  1) Daily check-in saja")
     print("  2) Tap-tap saja (max 1000/day)")
-    print("  3) Daily + Tap-tap + Mining Monitor (loop)")
+    print("  3) Daily + Tap-tap + Sync Balance Server (Loop 10s)")
     print("  4) Upgrade (komponen)")
     print("  5) Upgrade Tier")
     mode_map = {"1": "daily", "2": "tap", "3": "both", "4": "upgrade", "5": "tier"}
@@ -821,7 +762,6 @@ def choose_mode() -> str:
 
 
 def choose_components_all_accounts(accounts, token_cache):
-    """Use the first account only to display the catalog, then upgrade all accounts concurrently."""
     ref = accounts[0]
     token, _ = get_token(ref["email"], ref["password"], token_cache)
     token_cache[ref["email"]] = token
@@ -908,7 +848,7 @@ def main() -> None:
             return
 
         rows = [
-            {"index": i, "email": a["email"], "login": "WAIT", "daily": "WAIT", "tap": "WAIT", "mining": "WAIT", "balance": None, "detail": "Menunggu..."}
+            {"index": i, "email": a["email"], "login": "WAIT", "daily": "WAIT", "tap": "WAIT", "server_balance": None, "detail": "Menunggu..."}
             for i, a in enumerate(accounts, 1)
         ]
         results = [{"email": a["email"]} for a in accounts]
