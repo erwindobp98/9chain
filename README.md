@@ -1,1 +1,6 @@
-# 9chain
+```
+#   ACCOUNT       LOGIN      DAILY    TAP-TAP     MINING     BALANCE
+1   akun001       CACHE      DONE     1000/1000   ACTIVE     15,204.32
+2   akun002       LOGIN OK   DONE     1000/1000   ACTIVE      9,821.17
+3   akun003       CACHE      SKIP      850/1000   ACTIVE     21,553.80
+```
