@@ -562,7 +562,7 @@ def _account_worker(account, token_cache_snapshot, action, selected_components=N
     if action == "daily":
         result["checkin"] = with_program_retry(token, "ID", lambda: check_in(token))
     elif action == "tap":
-        result["tap"] = with_program_retry(token, "ID", lambda: tap_all(token, 1000))
+        result["tap"] = with_program_retry(token, "ID", lambda: tap_all(token, 2))
     elif action == "upgrade":
         result["upgrade"] = with_program_retry(
             token, "ID", lambda: upgrade_components(token, selected_components or [])
