@@ -585,7 +585,7 @@ def _account_worker(account, token_cache_snapshot, action, selected_components=N
     if action == "daily":
         result["checkin"] = with_program_retry(token, "ID", lambda: check_in(token))
     elif action == "tap":
-        result["tap"] = with_program_retry(token, "ID", lambda: tap_all(token, 100))
+        result["tap"] = with_program_retry(token, "ID", lambda: tap_all(token, 2))
     elif action == "upgrade":
         result["upgrade"] = with_program_retry(
             token, "ID", lambda: upgrade_components(token, selected_components or [])
@@ -763,7 +763,7 @@ def run_daily_tap_mining_loop(accounts, token_cache):
 def choose_mode() -> str:
     print("\nPilih mode aksi:")
     print("  1) Daily check-in saja")
-    print("  2) Tap-tap saja (max 100/request)")
+    print("  2) Tap-tap saja (max 1000/day)")
     print("  3) Daily + Tap-tap Loop (Auto Standby Reset Harian)")
     print("  4) Upgrade (komponen)")
     print("  5) Upgrade Tier")
