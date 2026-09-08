@@ -47,9 +47,10 @@ def get_session() -> requests.Session:
 
 
 class ApiError(RuntimeError):
-    def __init__(self, message: str, *, is_max_constraint: bool = False):
+    def __init__(self, message: str, *, is_max_constraint: bool = False, status_code: int = 0):
         super().__init__(message)
         self.is_max_constraint = is_max_constraint
+        self.status_code = status_code
 
 
 def ask(question: str) -> str:
@@ -117,10 +118,11 @@ def decode_jwt_exp(token: str) -> Optional[int]:
 
 
 def is_token_valid(token: str) -> bool:
+    """Periksa token valid dengan buffer waktu 5 menit"""
     exp_ms = decode_jwt_exp(token)
     if not exp_ms:
         return False
-    return exp_ms - int(time.time() * 1000) > 60_000
+    return exp_ms - int(time.time() * 1000) > 300_000  # 5 menit buffer
 
 
 def response_json(res: requests.Response) -> Dict[str, Any]:
@@ -174,19 +176,24 @@ def api_request(
     payload: Optional[Dict[str, Any]] = None,
     timeout: int = 30,
 ) -> tuple[requests.Response, Dict[str, Any]]:
-    res = get_session().request(
-        method,
-        f"{BASE_URL}{path}",
-        headers=auth_headers(token),
-        json=payload,
-        timeout=timeout,
-    )
-    return res, response_json(res)
+    try:
+        res = get_session().request(
+            method,
+            f"{BASE_URL}{path}",
+            headers=auth_headers(token),
+            json=payload,
+            timeout=timeout,
+        )
+        return res, response_json(res)
+    except requests.exceptions.RequestException as exc:
+        raise ApiError(f"Request failed: {str(exc)}") from exc
 
 
 def set_profile_country(token: str, country: str = "ID") -> Dict[str, Any]:
     res, data = api_request("PATCH", "/me/profile", token, payload={"country": country})
     if not res.ok or not data.get("success"):
+        if res.status_code == 401:
+            raise ApiError("Token expired", status_code=401)
         raise ApiError(f"set profile gagal: {res.status_code} {json.dumps(data, ensure_ascii=False)}")
     return data.get("data", {})
 
@@ -194,18 +201,27 @@ def set_profile_country(token: str, country: str = "ID") -> Dict[str, Any]:
 def enter_program(token: str) -> Dict[str, Any]:
     res, data = api_request("POST", "/program/enter", token)
     if not res.ok or not data.get("success"):
+        if res.status_code == 401:
+            raise ApiError("Token expired", status_code=401)
         raise ApiError(f"enter program gagal: {res.status_code} {json.dumps(data, ensure_ascii=False)}")
     return data.get("data", {})
 
 
 def ensure_program_ready(token: str, country: str = "ID") -> None:
-    set_profile_country(token, country)
-    enter_program(token)
+    try:
+        set_profile_country(token, country)
+        enter_program(token)
+    except ApiError as exc:
+        if exc.status_code == 401:
+            raise
+        raise
 
 
 def check_in(token: str) -> Dict[str, Any]:
     status_res, status = api_request("GET", "/me/check-in", token)
     if not status_res.ok or not status.get("success"):
+        if status_res.status_code == 401:
+            raise ApiError("Token expired", status_code=401)
         raise ApiError(
             f"check-in status gagal: {status_res.status_code} "
             f"{json.dumps(status, ensure_ascii=False)}"
@@ -221,6 +237,8 @@ def check_in(token: str) -> Dict[str, Any]:
 
     claim_res, claim = api_request("POST", "/me/check-in", token)
     if not claim_res.ok or not claim.get("success"):
+        if claim_res.status_code == 401:
+            raise ApiError("Token expired", status_code=401)
         raise ApiError(
             f"claim check-in gagal: {claim_res.status_code} "
             f"{json.dumps(claim, ensure_ascii=False)}"
@@ -238,6 +256,9 @@ def tap_once(token: str, count: int) -> Dict[str, Any]:
     res, data = api_request("POST", "/program/tap", token, payload={"count": count})
 
     if not res.ok or not data.get("success"):
+        if res.status_code == 401:
+            raise ApiError("Token expired", status_code=401)
+        
         error = data.get("error") or {}
         details = error.get("details") or {}
         fields = details.get("fields") or []
@@ -254,16 +275,20 @@ def tap_once(token: str, count: int) -> Dict[str, Any]:
         raise ApiError(
             f"tap gagal: {res.status_code} {json.dumps(data, ensure_ascii=False)}",
             is_max_constraint=is_max_constraint,
+            status_code=res.status_code,
         )
 
     return data.get("data") or {}
 
 
 def tap_all(token: str, start_count: int = 100) -> Dict[str, Any]:
+    """Tap dengan retry jika masih ada sisa kuota"""
     batch_size = start_count
     last_result: Optional[Dict[str, Any]] = None
     history: List[Dict[str, Any]] = []
+    total_taps = 0
 
+    # Phase 1: Find optimal batch size
     low = 1
     high = start_count
 
@@ -277,11 +302,13 @@ def tap_all(token: str, start_count: int = 100) -> Dict[str, Any]:
             batch_size = mid
 
             state = result.get("state") or {}
+            total_taps += mid
             if state.get("tapsRemaining", 0) <= 0:
                 return {
                     "history": history,
                     "finalState": state,
                     "batchSizeFound": batch_size,
+                    "totalTaps": total_taps,
                 }
         except ApiError as exc:
             if exc.is_max_constraint:
@@ -294,29 +321,92 @@ def tap_all(token: str, start_count: int = 100) -> Dict[str, Any]:
     if batch_size < 1:
         raise ApiError("Tidak bisa menemukan batch size yang valid untuk tap.")
 
-    while last_result is None or (last_result.get("state") or {}).get("tapsRemaining", 0) > 0:
+    # Phase 2: Main tapping with retry mechanism
+    max_attempts = 100
+    attempts = 0
+    retry_delay = 10
+    consecutive_errors = 0
+    max_consecutive_errors = 5
+    
+    while attempts < max_attempts:
+        attempts += 1
         remaining = (
             (last_result.get("state") or {}).get("tapsRemaining", float("inf"))
             if last_result
             else float("inf")
         )
+        
+        if remaining == float("inf") or remaining <= 0:
+            break
+            
         next_count = int(min(batch_size, remaining)) if remaining != float("inf") else batch_size
         if next_count <= 0:
             break
 
-        result = tap_once(token, next_count)
-        last_result = result
-        history.append(result)
+        try:
+            result = tap_once(token, next_count)
+            last_result = result
+            history.append(result)
+            total_taps += next_count
+            consecutive_errors = 0
+            
+            current_remaining = (result.get("state") or {}).get("tapsRemaining", 0)
+            if current_remaining <= 0:
+                break
+                
+            time.sleep(2.0)
+            
+        except ApiError as exc:
+            if exc.status_code == 401:
+                raise
+            
+            consecutive_errors += 1
+            history.append({"error": str(exc), "attempt": attempts})
+            
+            if consecutive_errors >= max_consecutive_errors:
+                break
+                
+            time.sleep(retry_delay)
 
-        if (result.get("state") or {}).get("tapsRemaining", 0) <= 0:
+    # Phase 3: Retry jika masih ada sisa kuota
+    final_remaining = (last_result.get("state") or {}).get("tapsRemaining", 0) if last_result else 0
+    
+    retry_attempts = 0
+    max_retry_attempts = 10
+    
+    while final_remaining > 0 and retry_attempts < max_retry_attempts:
+        retry_attempts += 1
+        try:
+            retry_count = min(10, final_remaining)
+            result = tap_once(token, retry_count)
+            last_result = result
+            history.append(result)
+            total_taps += retry_count
+            
+            final_remaining = (result.get("state") or {}).get("tapsRemaining", 0)
+            
+            if final_remaining <= 0:
+                break
+                
+            time.sleep(3.0)
+            
+        except ApiError as exc:
+            if exc.status_code == 401:
+                raise
+            history.append({"error": str(exc), "retry_attempt": retry_attempts})
             break
-        time.sleep(2.0)
+        except Exception as exc:
+            history.append({"error": str(exc), "retry_attempt": retry_attempts})
+            break
 
     final_state = (last_result or {}).get("state") or {}
     return {
         "history": history,
         "finalState": final_state,
         "batchSizeFound": batch_size,
+        "totalTaps": total_taps,
+        "retryAttempts": retry_attempts,
+        "finalRemaining": final_remaining,
     }
 
 
@@ -327,6 +417,8 @@ def is_country_required_error(message: str) -> bool:
 def get_state(token: str) -> Dict[str, Any]:
     res, data = api_request("GET", "/program/state", token)
     if not res.ok or not data.get("success"):
+        if res.status_code == 401:
+            raise ApiError("Token expired", status_code=401)
         raise ApiError(f"state gagal: {res.status_code} {json.dumps(data, ensure_ascii=False)}")
     return data
 
@@ -334,6 +426,8 @@ def get_state(token: str) -> Dict[str, Any]:
 def get_catalog(token: str) -> List[Dict[str, Any]]:
     res, data = api_request("GET", "/program/catalog", token)
     if not res.ok or not data.get("success"):
+        if res.status_code == 401:
+            raise ApiError("Token expired", status_code=401)
         raise ApiError(f"catalog gagal: {res.status_code} {json.dumps(data, ensure_ascii=False)}")
     return ((data.get("data") or {}).get("components") or [])
 
@@ -346,6 +440,8 @@ def upgrade_once(token: str, component_key: str, to_level: int) -> Dict[str, Any
         payload={"componentKey": component_key, "toLevel": to_level},
     )
     if not res.ok or not data.get("success"):
+        if res.status_code == 401:
+            raise ApiError("Token expired", status_code=401)
         raise ApiError(
             f"upgrade {component_key} gagal: {res.status_code} "
             f"{json.dumps(data, ensure_ascii=False)}"
@@ -361,6 +457,8 @@ def upgrade_node_tier(token: str, to_tier: int) -> Dict[str, Any]:
         payload={"toTier": to_tier},
     )
     if not res.ok or not data.get("success"):
+        if res.status_code == 401:
+            raise ApiError("Token expired", status_code=401)
         raise ApiError(
             f"upgrade node tier gagal: {res.status_code} "
             f"{json.dumps(data, ensure_ascii=False)}"
@@ -396,7 +494,9 @@ def upgrade_components(token: str, selected_keys: Sequence[str]) -> List[Dict[st
                     "cost": result.get("cost"),
                 }
             )
-        except Exception as exc:
+        except ApiError as exc:
+            if exc.status_code == 401:
+                raise
             summary.append({"componentKey": key, "error": str(exc)})
 
         time.sleep(2.1)
@@ -419,17 +519,49 @@ def upgrade_tier(token: str) -> Dict[str, Any]:
     }
 
 
-def with_program_retry(token: str, country: str, func):
-    try:
-        return func()
-    except Exception as exc:
-        if is_country_required_error(str(exc)):
-            ensure_program_ready(token, country)
-            try:
-                return func()
-            except Exception as retry_exc:
-                return {"error": str(retry_exc)}
-        return {"error": str(exc)}
+def with_program_retry(token: str, country: str, func, email: str = None, token_cache: Dict = None):
+    """Wrapper dengan retry logic yang lebih baik"""
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            return func()
+        except ApiError as exc:
+            if exc.status_code == 401 and token_cache and email:
+                print(f"[{email}] Token expired, refreshing... (attempt {attempt+1}/{max_retries})")
+                try:
+                    accounts = load_accounts()
+                    for acc in accounts:
+                        if acc["email"] == email:
+                            new_token = login(acc["email"], acc["password"])
+                            token_cache[email] = new_token
+                            token = new_token
+                            def new_func():
+                                return func()
+                            return new_func()
+                            break
+                except Exception as refresh_error:
+                    return {"error": f"Token refresh failed: {str(refresh_error)}"}
+            elif is_country_required_error(str(exc)):
+                ensure_program_ready(token, country)
+                try:
+                    return func()
+                except Exception as retry_exc:
+                    if attempt == max_retries - 1:
+                        return {"error": str(retry_exc)}
+                    time.sleep(5)
+                    continue
+            else:
+                if attempt == max_retries - 1:
+                    return {"error": str(exc)}
+                time.sleep(5)
+                continue
+        except Exception as exc:
+            if attempt == max_retries - 1:
+                return {"error": str(exc)}
+            time.sleep(5)
+            continue
+    
+    return {"error": "Max retries exceeded"}
 
 
 # ----------------------------- Parallel / Rich runtime -----------------------------
@@ -444,7 +576,8 @@ except ImportError:
     Panel = None
 
 WIB_RESET_HOUR = 7
-MAX_WORKERS = 20
+MAX_WORKERS = 10
+CYCLE_DELAY_MINUTES = 1
 
 
 def build_result_parts(res: Dict[str, Any]) -> List[str]:
@@ -486,7 +619,6 @@ def short_account(email: str) -> str:
 
 
 def extract_server_balance(state_response: Dict[str, Any]) -> Optional[float]:
-    """Mengambil Saldo Aktif dari response API."""
     if not isinstance(state_response, dict):
         return None
 
@@ -508,7 +640,6 @@ def extract_server_balance(state_response: Dict[str, Any]) -> Optional[float]:
 
 
 def extract_node_tier(state_response: Dict[str, Any]) -> str:
-    """Mengambil level Node Tier dari response API."""
     if not isinstance(state_response, dict):
         return "-"
     
@@ -519,7 +650,7 @@ def extract_node_tier(state_response: Dict[str, Any]) -> str:
     return "-"
 
 
-def make_dashboard(rows: List[Dict[str, Any]], phase: str, cycle: int, countdown: str = ""):
+def make_dashboard(rows: List[Dict[str, Any]], phase: str, cycle: int, countdown: str = "", next_cycle_in: str = ""):
     table = Table(
         title=f"🚀 9CHAIN • {phase} • CYCLE #{cycle}",
         expand=True,
@@ -549,6 +680,8 @@ def make_dashboard(rows: List[Dict[str, Any]], phase: str, cycle: int, countdown
     subtitle = f"Accounts: {len(rows)}"
     if countdown:
         subtitle += f" • Next daily: {countdown}"
+    if next_cycle_in:
+        subtitle += f" • Next cycle in: {next_cycle_in}"
     return Panel(table, subtitle=subtitle, border_style="bright_blue")
 
 
@@ -560,7 +693,6 @@ def save_results(results: List[Dict[str, Any]]):
 
 
 def fetch_account_info(row: Dict[str, Any], token_cache: Optional[Dict[str, str]] = None):
-    """Mengambil informasi Tier dari server."""
     email = row.get("email")
     token = row.get("_token")
 
@@ -583,16 +715,25 @@ def _account_worker(account, token_cache_snapshot, action, selected_components=N
     result = {"email": email, "token": token, "tokenFromCache": from_cache}
 
     if action == "daily":
-        result["checkin"] = with_program_retry(token, "ID", lambda: check_in(token))
+        result["checkin"] = with_program_retry(token, "ID", lambda: check_in(token), email, local_cache)
     elif action == "tap":
-        result["tap"] = with_program_retry(token, "ID", lambda: tap_all(token, 2))
+        result["tap"] = with_program_retry(token, "ID", lambda: tap_all(token, 100), email, local_cache)
     elif action == "upgrade":
         result["upgrade"] = with_program_retry(
-            token, "ID", lambda: upgrade_components(token, selected_components or [])
+            token, "ID", lambda: upgrade_components(token, selected_components or []), email, local_cache
         )
     elif action == "tier":
-        result["tier"] = with_program_retry(token, "ID", lambda: upgrade_tier(token))
+        result["tier"] = with_program_retry(token, "ID", lambda: upgrade_tier(token), email, local_cache)
+    elif action == "both":
+        # Untuk mode both, jalankan daily dulu baru tap
+        checkin_result = with_program_retry(token, "ID", lambda: check_in(token), email, local_cache)
+        tap_result = with_program_retry(token, "ID", lambda: tap_all(token, 100), email, local_cache)
+        result["checkin"] = checkin_result
+        result["tap"] = tap_result
 
+    if email in local_cache:
+        result["token"] = local_cache[email]
+    
     return result
 
 
@@ -602,13 +743,14 @@ def _parallel_action(accounts, rows, token_cache, action, live, cycle, results, 
         "tap": "TAP-TAP",
         "upgrade": "UPGRADE",
         "tier": "TIER",
+        "both": "DAILY+TAP",
     }
-    phase = phase_names[action]
+    phase = phase_names.get(action, action.upper())
 
     for row in rows:
-        if action == "daily":
+        if action == "daily" or action == "both":
             row["daily"] = "RUNNING"
-        elif action == "tap":
+        if action == "tap" or action == "both":
             row["tap"] = "RUNNING"
         row["detail"] = f"{phase} berjalan..."
     live.update(make_dashboard(rows, phase, cycle))
@@ -638,53 +780,94 @@ def _parallel_action(accounts, rows, token_cache, action, live, cycle, results, 
                 row["login"] = "CACHE" if result.get("tokenFromCache") else "LOGIN OK"
                 row["status_result"] = result
 
-                # Ambil info Tier saat aksi berjalan
                 fetch_account_info(row, token_cache)
 
-                if action == "daily":
+                # Handle both mode
+                if action == "both":
+                    # Daily result
                     checkin = result.get("checkin") or {}
                     if checkin.get("error"):
                         row["daily"] = "ERROR"
-                        row["detail"] = checkin["error"][:100]
+                        row["detail"] = f"Daily: ✗ {checkin['error'][:40]}"
                     elif checkin.get("claimed"):
                         row["daily"] = "DONE"
-                        row["detail"] = f"Reward +{checkin.get('reward')} | streak {checkin.get('streak')}"
+                        reward = checkin.get('reward', '?')
+                        streak = checkin.get('streak', '?')
+                        row["detail"] = f"Daily: ✓ +{reward} | streak {streak}"
                     else:
                         row["daily"] = "SKIP"
-                        row["detail"] = "Sudah check-in hari ini"
+                        row["detail"] = "Daily: ✓ Sudah check-in"
+
+                    # Tap result
+                    tap = result.get("tap") or {}
+                    if tap.get("error"):
+                        row["tap"] = "ERROR"
+                        row["detail"] += f" | Tap: ✗ {tap['error'][:40]}"
+                    else:
+                        final_state = tap.get("finalState") or {}
+                        remaining = final_state.get('tapsRemaining', '?')
+                        batch = tap.get('batchSizeFound', '?')
+                        total = tap.get('totalTaps', '?')
+                        retry = tap.get('retryAttempts', 0)
+                        
+                        row["tap"] = "DONE" if remaining == 0 else "PARTIAL"
+                        row["detail"] += f" | Tap: ✓ Batch={batch} | Rem={remaining} | Taps={total}"
+
+                elif action == "daily":
+                    checkin = result.get("checkin") or {}
+                    if checkin.get("error"):
+                        row["daily"] = "ERROR"
+                        row["detail"] = f"✗ {checkin['error'][:80]}"
+                    elif checkin.get("claimed"):
+                        row["daily"] = "DONE"
+                        reward = checkin.get('reward', '?')
+                        streak = checkin.get('streak', '?')
+                        row["detail"] = f"✓ Reward +{reward} | streak {streak}"
+                    else:
+                        row["daily"] = "SKIP"
+                        row["detail"] = "✓ Sudah check-in hari ini"
 
                 elif action == "tap":
                     tap = result.get("tap") or {}
                     if tap.get("error"):
                         row["tap"] = "ERROR"
-                        row["detail"] = tap["error"][:100]
+                        row["detail"] = f"✗ {tap['error'][:80]}"
                     else:
                         final_state = tap.get("finalState") or {}
-                        row["tap"] = "DONE"
-                        row["detail"] = (
-                            f"Tap batch={tap.get('batchSizeFound')} | "
-                            f"remaining={final_state.get('tapsRemaining')}"
-                        )
+                        remaining = final_state.get('tapsRemaining', '?')
+                        batch = tap.get('batchSizeFound', '?')
+                        total = tap.get('totalTaps', '?')
+                        retry = tap.get('retryAttempts', 0)
+                        
+                        row["tap"] = "DONE" if remaining == 0 else "PARTIAL"
+                        row["detail"] = f"✓ Batch={batch} | Remaining={remaining} | Taps={total} | Retry={retry}"
 
                 elif action == "upgrade":
                     value = result.get("upgrade") or {}
-                    res_parts = build_result_parts({"upgrade": value})
-                    row["detail"] = res_parts[0] if res_parts else "Upgrade selesai"
+                    if isinstance(value, dict) and value.get("error"):
+                        row["detail"] = f"✗ {value['error'][:80]}"
+                    else:
+                        res_parts = build_result_parts({"upgrade": value})
+                        row["detail"] = res_parts[0] if res_parts else "✓ Upgrade selesai"
 
                 elif action == "tier":
                     value = result.get("tier") or {}
-                    res_parts = build_result_parts({"tier": value})
-                    row["detail"] = res_parts[0] if res_parts else "Tier selesai"
+                    if isinstance(value, dict) and value.get("error"):
+                        row["detail"] = f"✗ {value['error'][:80]}"
+                    else:
+                        res_parts = build_result_parts({"tier": value})
+                        row["detail"] = res_parts[0] if res_parts else "✓ Tier selesai"
 
                 results[pos].update(result)
                 results[pos]["status"] = "success"
             except Exception as exc:
-                results[pos].update({"email": row["email"], "error": str(exc), "status": "failed"})
-                if action == "daily":
+                error_msg = str(exc)
+                results[pos].update({"email": row["email"], "error": error_msg, "status": "failed"})
+                if action == "daily" or action == "both":
                     row["daily"] = "ERROR"
-                elif action == "tap":
+                if action == "tap" or action == "both":
                     row["tap"] = "ERROR"
-                row["detail"] = str(exc)[:120]
+                row["detail"] = f"✗ {error_msg[:80]}"
 
             save_token_cache(token_cache)
             live.update(make_dashboard(rows, phase, cycle))
@@ -721,6 +904,16 @@ def standby_until_reset(rows: List[Dict[str, Any]], cycle: int, live: Any):
         time.sleep(1.0)
 
 
+def cycle_delay(rows: List[Dict[str, Any]], cycle: int, live: Any, delay_minutes: int = 1):
+    """Delay antara cycle dengan countdown."""
+    delay_seconds = delay_minutes * 60
+    for remaining in range(delay_seconds, 0, -1):
+        if remaining % 10 == 0 or remaining <= 5:
+            countdown = format_countdown(remaining)
+            live.update(make_dashboard(rows, f"WAITING (DELAY {delay_minutes}m)", cycle, next_cycle_in=countdown))
+        time.sleep(1)
+
+
 def run_daily_tap_mining_loop(accounts, token_cache):
     rows = [
         {
@@ -743,30 +936,32 @@ def run_daily_tap_mining_loop(accounts, token_cache):
     with Live(make_dashboard(rows, "STARTING", cycle), refresh_per_second=4, screen=True) as live:
         while True:
             cycle += 1
+            
             for row in rows:
                 row["daily"] = "WAIT"
                 row["tap"] = "WAIT"
                 row["detail"] = "Memulai siklus harian..."
             live.update(make_dashboard(rows, "DAILY", cycle))
 
-            # 1) DAILY
-            _parallel_action(accounts, rows, token_cache, "daily", live, cycle, results)
-
-            # 2) TAP-TAP
-            _parallel_action(accounts, rows, token_cache, "tap", live, cycle, results)
+            # Jalankan daily + tap sekaligus
+            _parallel_action(accounts, rows, token_cache, "both", live, cycle, results)
             save_results(results)
 
-            # 3) Standby Tanpa Server Polling Hingga Reset Harian
+            # Delay 1 menit sebelum standby
+            cycle_delay(rows, cycle, live, CYCLE_DELAY_MINUTES)
+
+            # Standby hingga reset harian
             standby_until_reset(rows, cycle, live)
 
 
 def choose_mode() -> str:
     print("\nPilih mode aksi:")
-    print("  1) Daily check-in saja")
-    print("  2) Tap-tap saja (max 1000/day)")
+    print("  1) Daily check-in (auto loop ke daily+tap setelah selesai)")
+    print("  2) Tap-tap (auto loop ke daily+tap setelah selesai)")
     print("  3) Daily + Tap-tap Loop (Auto Standby Reset Harian)")
-    print("  4) Upgrade (komponen)")
-    print("  5) Upgrade Tier")
+    print("  4) Upgrade komponen (auto loop ke daily+tap setelah selesai)")
+    print("  5) Upgrade Tier (auto loop ke daily+tap setelah selesai)")
+    print("\n[NOTE] Semua mode akan otomatis beralih ke loop daily+tap setelah selesai!")
     mode_map = {"1": "daily", "2": "tap", "3": "both", "4": "upgrade", "5": "tier"}
     mode = mode_map.get(ask("\nPilihan (1/2/3/4/5): "))
     if not mode:
@@ -858,36 +1053,45 @@ def main() -> None:
         print("Semua akun akan diproses bersamaan sesuai urutan accounts.json.")
         mode = choose_mode()
 
-        if mode == "both":
-            run_daily_tap_mining_loop(accounts, token_cache)
-            return
+        # Jika mode bukan "both", jalankan sekali lalu lanjut ke loop
+        if mode != "both":
+            if Live is None:
+                raise RuntimeError("Rich belum terinstall. Jalankan: pip install requests rich")
 
-        if Live is None:
-            raise RuntimeError("Rich belum terinstall. Jalankan: pip install requests rich")
+            selected_components = []
+            if mode == "upgrade":
+                selected_components = choose_components_all_accounts(accounts, token_cache)
+            if mode == "tier" and not preview_tier_all_accounts(accounts, token_cache):
+                print("Dibatalkan.")
+                return
 
-        selected_components = []
-        if mode == "upgrade":
-            selected_components = choose_components_all_accounts(accounts, token_cache)
-        if mode == "tier" and not preview_tier_all_accounts(accounts, token_cache):
-            print("Dibatalkan.")
-            return
+            rows = [
+                {"index": i, "email": a["email"], "login": "WAIT", "daily": "WAIT", "tap": "WAIT", "tier": "-", "detail": "Menunggu..."}
+                for i, a in enumerate(accounts, 1)
+            ]
+            results = [{"email": a["email"]} for a in accounts]
 
-        rows = [
-            {"index": i, "email": a["email"], "login": "WAIT", "daily": "WAIT", "tap": "WAIT", "tier": "-", "detail": "Menunggu..."}
-            for i, a in enumerate(accounts, 1)
-        ]
-        results = [{"email": a["email"]} for a in accounts]
+            # Jalankan mode yang dipilih sekali
+            with Live(make_dashboard(rows, mode.upper(), 1), refresh_per_second=4, screen=True) as live:
+                _parallel_action(accounts, rows, token_cache, mode, live, 1, results, selected_components)
+            
+            save_results(results)
+            print(f"\n✓ {mode.upper()} selesai! Beralih ke mode loop daily+tap...")
+            print("=" * 50)
+            
+            # Tunggu 3 detik sebelum beralih ke loop
+            time.sleep(3)
 
-        with Live(make_dashboard(rows, mode.upper(), 1), refresh_per_second=4, screen=True) as live:
-            _parallel_action(accounts, rows, token_cache, mode, live, 1, results, selected_components)
-        save_results(results)
-        print(f"\nSelesai. Hasil: {RESULTS_FILE} | Token: {TOKENS_FILE}")
+        # Mulai loop daily+tap (mode both)
+        print("\n🚀 Memulai Daily + Tap Loop (Auto Standby Reset Harian)")
+        print("=" * 50)
+        run_daily_tap_mining_loop(accounts, token_cache)
 
     except KeyboardInterrupt:
-        print("\nDihentikan pengguna.")
+        print("\n\n⚠️ Dihentikan pengguna.")
         sys.exit(130)
     except Exception as exc:
-        print(f"\nERROR: {exc}")
+        print(f"\n❌ ERROR: {exc}")
         sys.exit(1)
 
 
