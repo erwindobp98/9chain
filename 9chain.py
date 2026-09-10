@@ -37,6 +37,19 @@ KNOWN_COMPONENTS = [
 
 THREAD_LOCAL = threading.local()
 
+# ==================== KONFIGURASI TAP ====================
+TAP_BATCH_SIZE = 2          # Jumlah tap per request
+TAP_DELAY_SECONDS = 1.0     # Delay antar request (detik)
+TAP_RETRY_DELAY = 5         # Delay saat retry jika error
+TAP_MAX_CONSECUTIVE_ERRORS = 10 # Maksimal error beruntun sebelum berhenti
+# ========================================================
+
+# ==================== KONFIGURASI LOOP ====================
+WIB_RESET_HOUR = 7          # Jam reset harian (WIB)
+MAX_WORKERS = 10            # Jumlah worker paralel
+CYCLE_DELAY_MINUTES = 1     # Delay 1 menit SEBELUM memulai cycle
+# ========================================================
+
 
 def get_session() -> requests.Session:
     session = getattr(THREAD_LOCAL, "session", None)
@@ -281,65 +294,64 @@ def tap_once(token: str, count: int) -> Dict[str, Any]:
     return data.get("data") or {}
 
 
-def tap_all(token: str, start_count: int = 100) -> Dict[str, Any]:
-    """Tap dengan retry jika masih ada sisa kuota"""
-    batch_size = start_count
-    last_result: Optional[Dict[str, Any]] = None
-    history: List[Dict[str, Any]] = []
+def tap_until_complete(token: str) -> Dict[str, Any]:
+    """
+    Tap terus menerus sampai tapsRemaining = 0
+    Bonus kuota dari daily/streak/level akan otomatis terdeteksi
+    karena kita selalu cek state sebelum tap
+    """
+    batch_size = TAP_BATCH_SIZE
     total_taps = 0
-
-    # Phase 1: Find optimal batch size
-    low = 1
-    high = start_count
-
-    while low < high:
-        mid = (low + high + 1) // 2
-        try:
-            result = tap_once(token, mid)
-            last_result = result
-            history.append(result)
-            low = mid
-            batch_size = mid
-
-            state = result.get("state") or {}
-            total_taps += mid
-            if state.get("tapsRemaining", 0) <= 0:
-                return {
-                    "history": history,
-                    "finalState": state,
-                    "batchSizeFound": batch_size,
-                    "totalTaps": total_taps,
-                }
-        except ApiError as exc:
-            if exc.is_max_constraint:
-                high = mid - 1
-            else:
-                raise
-
-        time.sleep(2.0)
-
-    if batch_size < 1:
-        raise ApiError("Tidak bisa menemukan batch size yang valid untuk tap.")
-
-    # Phase 2: Main tapping with retry mechanism
-    max_attempts = 100
-    attempts = 0
-    retry_delay = 10
-    consecutive_errors = 0
-    max_consecutive_errors = 5
+    history: List[Dict[str, Any]] = []
+    total_quota_initial = 0
     
+    # Ambil state awal untuk mengetahui total kuota
+    try:
+        state = get_state(token)
+        state_data = state.get("data") or {}
+        total_quota_initial = state_data.get("tapsRemaining", 0)
+        if total_quota_initial == 0:
+            taps_used = state_data.get("tapsUsed", 0)
+            total_quota_initial = taps_used + state_data.get("tapsRemaining", 0)
+    except Exception as e:
+        print(f"[Tap] Warning: Gagal ambil total kuota: {e}")
+        total_quota_initial = 0
+
+    print(f"[Tap] Total kuota awal: {total_quota_initial} tap")
+    print(f"[Tap] Batch size: {batch_size}, Delay: {TAP_DELAY_SECONDS}s")
+
+    last_result = None
+    attempts = 0
+    consecutive_errors = 0
+    max_attempts = 1000  # Cukup besar untuk menampung semua kuota + bonus
+    
+    # ============ LOOP UTAMA: TAP SAMPAI KUOTA HABIS ============
     while attempts < max_attempts:
         attempts += 1
-        remaining = (
-            (last_result.get("state") or {}).get("tapsRemaining", float("inf"))
-            if last_result
-            else float("inf")
-        )
         
-        if remaining == float("inf") or remaining <= 0:
-            break
+        # Cek sisa kuota dari state terbaru
+        try:
+            state = get_state(token)
+            state_data = state.get("data") or {}
+            remaining = state_data.get("tapsRemaining", 0)
             
-        next_count = int(min(batch_size, remaining)) if remaining != float("inf") else batch_size
+            # Update total kuota jika berubah (bonus dari daily/streak)
+            if total_quota_initial == 0:
+                taps_used = state_data.get("tapsUsed", 0)
+                total_quota_initial = taps_used + remaining
+            
+            # Jika kuota habis, selesai
+            if remaining <= 0:
+                print(f"[Tap] ✅ Kuota habis! Total tap: {total_taps}")
+                break
+                
+        except Exception as e:
+            print(f"[Tap] Error get state: {e}")
+            time.sleep(2)
+            continue
+            
+        # Tentukan jumlah tap kali ini
+        next_count = int(min(batch_size, remaining))
         if next_count <= 0:
             break
 
@@ -350,63 +362,73 @@ def tap_all(token: str, start_count: int = 100) -> Dict[str, Any]:
             total_taps += next_count
             consecutive_errors = 0
             
+            # Ambil sisa kuota terbaru dari response
             current_remaining = (result.get("state") or {}).get("tapsRemaining", 0)
+            
+            # Tampilkan progress
+            if total_quota_initial > 0:
+                percent = (total_taps / total_quota_initial) * 100 if total_quota_initial > 0 else 0
+                print(f"[Tap] +{next_count} | {total_taps}/{total_quota_initial} ({percent:.1f}%) | Rem: {current_remaining}")
+            else:
+                print(f"[Tap] +{next_count} | Total: {total_taps} | Rem: {current_remaining}")
+            
+            # Jika kuota habis, selesai
             if current_remaining <= 0:
+                print(f"[Tap] ✅ Kuota habis! Total tap: {total_taps}")
                 break
                 
-            time.sleep(2.0)
+            time.sleep(TAP_DELAY_SECONDS)
             
         except ApiError as exc:
             if exc.status_code == 401:
+                print(f"[Tap] ❌ Token expired!")
                 raise
             
             consecutive_errors += 1
             history.append({"error": str(exc), "attempt": attempts})
+            print(f"[Tap] ⚠️ Error: {exc} (consecutive: {consecutive_errors}/{TAP_MAX_CONSECUTIVE_ERRORS})")
             
-            if consecutive_errors >= max_consecutive_errors:
+            if consecutive_errors >= TAP_MAX_CONSECUTIVE_ERRORS:
+                print(f"[Tap] ❌ Terlalu banyak error beruntun, berhenti...")
                 break
                 
-            time.sleep(retry_delay)
-
-    # Phase 3: Retry jika masih ada sisa kuota
-    final_remaining = (last_result.get("state") or {}).get("tapsRemaining", 0) if last_result else 0
-    
-    retry_attempts = 0
-    max_retry_attempts = 10
-    
-    while final_remaining > 0 and retry_attempts < max_retry_attempts:
-        retry_attempts += 1
-        try:
-            retry_count = min(10, final_remaining)
-            result = tap_once(token, retry_count)
-            last_result = result
-            history.append(result)
-            total_taps += retry_count
-            
-            final_remaining = (result.get("state") or {}).get("tapsRemaining", 0)
-            
-            if final_remaining <= 0:
-                break
-                
-            time.sleep(3.0)
-            
-        except ApiError as exc:
-            if exc.status_code == 401:
-                raise
-            history.append({"error": str(exc), "retry_attempt": retry_attempts})
-            break
+            time.sleep(TAP_RETRY_DELAY)
         except Exception as exc:
-            history.append({"error": str(exc), "retry_attempt": retry_attempts})
-            break
+            consecutive_errors += 1
+            print(f"[Tap] ⚠️ Unexpected error: {exc}")
+            if consecutive_errors >= TAP_MAX_CONSECUTIVE_ERRORS:
+                break
+            time.sleep(TAP_RETRY_DELAY)
 
+    # ============ FINAL CHECK ============
     final_state = (last_result or {}).get("state") or {}
+    final_remaining = final_state.get("tapsRemaining", 0)
+    
+    # Cek final state dari server
+    if final_remaining > 0:
+        try:
+            state = get_state(token)
+            state_data = state.get("data") or {}
+            final_remaining = state_data.get("tapsRemaining", 0)
+        except:
+            pass
+    
+    print(f"\n[Tap] 📊 FINAL REPORT:")
+    print(f"   Total Tap: {total_taps}")
+    print(f"   Final Remaining: {final_remaining}")
+    print(f"   Status: {'✅ COMPLETE' if final_remaining == 0 else '⚠️ PARTIAL'}")
+    
+    if final_remaining > 0:
+        print(f"   ⚠️ Masih ada {final_remaining} tap tersisa!")
+    
     return {
         "history": history,
         "finalState": final_state,
         "batchSizeFound": batch_size,
         "totalTaps": total_taps,
-        "retryAttempts": retry_attempts,
+        "totalQuota": total_quota_initial,
         "finalRemaining": final_remaining,
+        "isComplete": final_remaining == 0,
     }
 
 
@@ -575,10 +597,6 @@ except ImportError:
     Table = None
     Panel = None
 
-WIB_RESET_HOUR = 7
-MAX_WORKERS = 10
-CYCLE_DELAY_MINUTES = 1
-
 
 def build_result_parts(res: Dict[str, Any]) -> List[str]:
     parts = []
@@ -666,13 +684,28 @@ def make_dashboard(rows: List[Dict[str, Any]], phase: str, cycle: int, countdown
 
     for row in rows:
         tier_text = str(row.get("tier", "-"))
+        tap_display = str(row.get("tap", "WAIT"))
+        
+        tap_progress = row.get("tap_progress")
+        if tap_progress and tap_display not in ["WAIT", "RUNNING", "ERROR"]:
+            done = tap_progress.get("done", 0)
+            total = tap_progress.get("total", 0)
+            is_complete = tap_progress.get("is_complete", False)
+            
+            # ✅ FIX: Handle total sebagai number ATAU string dengan aman
+            if isinstance(total, (int, float)) and total > 0:
+                tap_display = f"{done}/{total}"
+                tap_display += " ✅" if is_complete else " ⚠️"
+            elif isinstance(total, str) and total:
+                tap_display = f"{done}/{total}"
+                tap_display += " ✅" if is_complete else " ⚠️"
 
         table.add_row(
             str(row["index"]),
             short_account(row["email"]),
             str(row.get("login", "WAIT")),
             str(row.get("daily", "WAIT")),
-            str(row.get("tap", "WAIT")),
+            tap_display,
             tier_text,
             str(row.get("detail", "")),
         )
@@ -681,7 +714,8 @@ def make_dashboard(rows: List[Dict[str, Any]], phase: str, cycle: int, countdown
     if countdown:
         subtitle += f" • Next daily: {countdown}"
     if next_cycle_in:
-        subtitle += f" • Next cycle in: {next_cycle_in}"
+        subtitle += f" • Starting in: {next_cycle_in}"
+    subtitle += f" • Tap: {TAP_BATCH_SIZE}/batch @ {1/TAP_DELAY_SECONDS:.1f}/s"
     return Panel(table, subtitle=subtitle, border_style="bright_blue")
 
 
@@ -717,7 +751,7 @@ def _account_worker(account, token_cache_snapshot, action, selected_components=N
     if action == "daily":
         result["checkin"] = with_program_retry(token, "ID", lambda: check_in(token), email, local_cache)
     elif action == "tap":
-        result["tap"] = with_program_retry(token, "ID", lambda: tap_all(token, 100), email, local_cache)
+        result["tap"] = with_program_retry(token, "ID", lambda: tap_until_complete(token), email, local_cache)
     elif action == "upgrade":
         result["upgrade"] = with_program_retry(
             token, "ID", lambda: upgrade_components(token, selected_components or []), email, local_cache
@@ -725,9 +759,8 @@ def _account_worker(account, token_cache_snapshot, action, selected_components=N
     elif action == "tier":
         result["tier"] = with_program_retry(token, "ID", lambda: upgrade_tier(token), email, local_cache)
     elif action == "both":
-        # Untuk mode both, jalankan daily dulu baru tap
         checkin_result = with_program_retry(token, "ID", lambda: check_in(token), email, local_cache)
-        tap_result = with_program_retry(token, "ID", lambda: tap_all(token, 100), email, local_cache)
+        tap_result = with_program_retry(token, "ID", lambda: tap_until_complete(token), email, local_cache)
         result["checkin"] = checkin_result
         result["tap"] = tap_result
 
@@ -774,7 +807,7 @@ def _parallel_action(accounts, rows, token_cache, action, live, cycle, results, 
             pos = futures[future]
             row = rows[pos]
             try:
-                result = future.result()
+                result = future.result(timeout=600)
                 token_cache[row["email"]] = result["token"]
                 row["_token"] = result["token"]
                 row["login"] = "CACHE" if result.get("tokenFromCache") else "LOGIN OK"
@@ -782,7 +815,6 @@ def _parallel_action(accounts, rows, token_cache, action, live, cycle, results, 
 
                 fetch_account_info(row, token_cache)
 
-                # Handle both mode
                 if action == "both":
                     # Daily result
                     checkin = result.get("checkin") or {}
@@ -804,14 +836,28 @@ def _parallel_action(accounts, rows, token_cache, action, live, cycle, results, 
                         row["tap"] = "ERROR"
                         row["detail"] += f" | Tap: ✗ {tap['error'][:40]}"
                     else:
-                        final_state = tap.get("finalState") or {}
-                        remaining = final_state.get('tapsRemaining', '?')
-                        batch = tap.get('batchSizeFound', '?')
-                        total = tap.get('totalTaps', '?')
-                        retry = tap.get('retryAttempts', 0)
+                        total_taps = tap.get('totalTaps', 0)
+                        total_quota = tap.get('totalQuota', 0)
+                        is_complete = tap.get('isComplete', False)
+                        remaining = tap.get('finalRemaining', '?')
                         
-                        row["tap"] = "DONE" if remaining == 0 else "PARTIAL"
-                        row["detail"] += f" | Tap: ✓ Batch={batch} | Rem={remaining} | Taps={total}"
+                        # ✅ FIX: Gunakan 0 jika total_quota tidak valid
+                        row["tap_progress"] = {
+                            "done": total_taps,
+                            "total": total_quota if total_quota > 0 else 0,
+                            "is_complete": is_complete,
+                        }
+                        
+                        if is_complete:
+                            row["tap"] = "DONE"
+                        else:
+                            row["tap"] = "PARTIAL"
+                        
+                        if total_quota > 0:
+                            status_icon = "✅" if is_complete else "⚠️"
+                            row["detail"] += f" | Tap: {status_icon} {total_taps}/{total_quota} | Rem:{remaining}"
+                        else:
+                            row["detail"] += f" | Tap: {total_taps} taps | Rem:{remaining}"
 
                 elif action == "daily":
                     checkin = result.get("checkin") or {}
@@ -833,14 +879,28 @@ def _parallel_action(accounts, rows, token_cache, action, live, cycle, results, 
                         row["tap"] = "ERROR"
                         row["detail"] = f"✗ {tap['error'][:80]}"
                     else:
-                        final_state = tap.get("finalState") or {}
-                        remaining = final_state.get('tapsRemaining', '?')
-                        batch = tap.get('batchSizeFound', '?')
-                        total = tap.get('totalTaps', '?')
-                        retry = tap.get('retryAttempts', 0)
+                        total_taps = tap.get('totalTaps', 0)
+                        total_quota = tap.get('totalQuota', 0)
+                        is_complete = tap.get('isComplete', False)
+                        remaining = tap.get('finalRemaining', '?')
                         
-                        row["tap"] = "DONE" if remaining == 0 else "PARTIAL"
-                        row["detail"] = f"✓ Batch={batch} | Remaining={remaining} | Taps={total} | Retry={retry}"
+                        # ✅ FIX: Gunakan 0 jika total_quota tidak valid
+                        row["tap_progress"] = {
+                            "done": total_taps,
+                            "total": total_quota if total_quota > 0 else 0,
+                            "is_complete": is_complete,
+                        }
+                        
+                        if is_complete:
+                            row["tap"] = "DONE"
+                        else:
+                            row["tap"] = "PARTIAL"
+                        
+                        if total_quota > 0:
+                            status_icon = "✅" if is_complete else "⚠️"
+                            row["detail"] = f"{status_icon} {total_taps}/{total_quota} | Rem:{remaining} | Batch:{tap.get('batchSizeFound')}"
+                        else:
+                            row["detail"] = f"{total_taps} taps | Rem:{remaining}"
 
                 elif action == "upgrade":
                     value = result.get("upgrade") or {}
@@ -904,13 +964,13 @@ def standby_until_reset(rows: List[Dict[str, Any]], cycle: int, live: Any):
         time.sleep(1.0)
 
 
-def cycle_delay(rows: List[Dict[str, Any]], cycle: int, live: Any, delay_minutes: int = 1):
-    """Delay antara cycle dengan countdown."""
+def cycle_delay_before_start(rows: List[Dict[str, Any]], cycle: int, live: Any, delay_minutes: int = 1):
+    """Delay 1 menit SEBELUM memulai cycle baru"""
     delay_seconds = delay_minutes * 60
     for remaining in range(delay_seconds, 0, -1):
         if remaining % 10 == 0 or remaining <= 5:
             countdown = format_countdown(remaining)
-            live.update(make_dashboard(rows, f"WAITING (DELAY {delay_minutes}m)", cycle, next_cycle_in=countdown))
+            live.update(make_dashboard(rows, f"WAITING TO START (DELAY {delay_minutes}m)", cycle, next_cycle_in=countdown))
         time.sleep(1)
 
 
@@ -924,6 +984,7 @@ def run_daily_tap_mining_loop(accounts, token_cache):
             "tap": "WAIT",
             "tier": "-",
             "detail": "Menunggu...",
+            "tap_progress": {"done": 0, "total": 0, "is_complete": False},
         }
         for i, acc in enumerate(accounts, start=1)
     ]
@@ -935,11 +996,16 @@ def run_daily_tap_mining_loop(accounts, token_cache):
 
     with Live(make_dashboard(rows, "STARTING", cycle), refresh_per_second=4, screen=True) as live:
         while True:
+            # DELAY 1 MENIT SEBELUM MEMULAI CYCLE
+            if cycle > 0:
+                cycle_delay_before_start(rows, cycle, live, CYCLE_DELAY_MINUTES)
+            
             cycle += 1
             
             for row in rows:
                 row["daily"] = "WAIT"
                 row["tap"] = "WAIT"
+                row["tap_progress"] = {"done": 0, "total": 0, "is_complete": False}
                 row["detail"] = "Memulai siklus harian..."
             live.update(make_dashboard(rows, "DAILY", cycle))
 
@@ -947,10 +1013,7 @@ def run_daily_tap_mining_loop(accounts, token_cache):
             _parallel_action(accounts, rows, token_cache, "both", live, cycle, results)
             save_results(results)
 
-            # Delay 1 menit sebelum standby
-            cycle_delay(rows, cycle, live, CYCLE_DELAY_MINUTES)
-
-            # Standby hingga reset harian
+            # LANGSUNG STANDBY TANPA DELAY
             standby_until_reset(rows, cycle, live)
 
 
@@ -1051,9 +1114,14 @@ def main() -> None:
 
         print(f"\nTotal akun dari accounts.json: {len(accounts)}")
         print("Semua akun akan diproses bersamaan sesuai urutan accounts.json.")
+        
+        print(f"\n📊 Konfigurasi Tap:")
+        print(f"   Batch Size: {TAP_BATCH_SIZE} tap/request")
+        print(f"   Kecepatan: {1/TAP_DELAY_SECONDS:.1f} tap/detik")
+        print(f"   Mode: Loop sampai kuota habis (termasuk bonus otomatis)")
+        
         mode = choose_mode()
 
-        # Jika mode bukan "both", jalankan sekali lalu lanjut ke loop
         if mode != "both":
             if Live is None:
                 raise RuntimeError("Rich belum terinstall. Jalankan: pip install requests rich")
@@ -1066,24 +1134,22 @@ def main() -> None:
                 return
 
             rows = [
-                {"index": i, "email": a["email"], "login": "WAIT", "daily": "WAIT", "tap": "WAIT", "tier": "-", "detail": "Menunggu..."}
+                {"index": i, "email": a["email"], "login": "WAIT", "daily": "WAIT", "tap": "WAIT", "tier": "-", "detail": "Menunggu...", "tap_progress": {"done": 0, "total": 0, "is_complete": False}}
                 for i, a in enumerate(accounts, 1)
             ]
             results = [{"email": a["email"]} for a in accounts]
 
-            # Jalankan mode yang dipilih sekali
             with Live(make_dashboard(rows, mode.upper(), 1), refresh_per_second=4, screen=True) as live:
                 _parallel_action(accounts, rows, token_cache, mode, live, 1, results, selected_components)
             
             save_results(results)
             print(f"\n✓ {mode.upper()} selesai! Beralih ke mode loop daily+tap...")
             print("=" * 50)
-            
-            # Tunggu 3 detik sebelum beralih ke loop
             time.sleep(3)
 
-        # Mulai loop daily+tap (mode both)
         print("\n🚀 Memulai Daily + Tap Loop (Auto Standby Reset Harian)")
+        print(f"📊 Tap Speed: {TAP_BATCH_SIZE} tap/batch @ {1/TAP_DELAY_SECONDS:.1f} taps/detik")
+        print("🔄 Mode: Loop sampai kuota habis (bonus otomatis terdeteksi)")
         print("=" * 50)
         run_daily_tap_mining_loop(accounts, token_cache)
 
@@ -1092,6 +1158,8 @@ def main() -> None:
         sys.exit(130)
     except Exception as exc:
         print(f"\n❌ ERROR: {exc}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
 
 
