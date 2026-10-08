@@ -176,7 +176,7 @@ CYCLE_DELAY_MINUTES = 1         # Delay 1 menit SEBELUM memulai cycle
 
 ```
 9chain-bot/
-├── bot.py                    # Script utama
+├── 9chain.py                 # Script utama
 ├── accounts.json             # Data akun (JANGAN di-commit!)
 ├── tokens.json               # Cache token (auto-generated)
 ├── login_results.json        # Hasil login (auto-generated)
