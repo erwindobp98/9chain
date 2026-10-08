@@ -1,0 +1,18 @@
+# Sensitive files
+accounts.json
+tokens.json
+login_results.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+venv/
+env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
