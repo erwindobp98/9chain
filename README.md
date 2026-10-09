@@ -31,7 +31,7 @@ Bot otomasi untuk platform **9Chain** yang mendukung daily check-in, tap-tap min
 ### 1. Clone Repository
 
 ```bash
-git clone https://github.com/username/9chain.git
+git clone https://github.com/erwindobp98/9chain.git
 cd 9chain
 ```
 
